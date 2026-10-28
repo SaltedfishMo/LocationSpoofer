@@ -1,0 +1,127 @@
+name: Build APK
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README*.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish as GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build LocationSpoofer APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Keystore
+        id: setup_keystore
+        run: |
+          mkdir -p "$RUNNER_TEMP"
+          KEYSTORE_FILE="$RUNNER_TEMP/keystore.jks"
+
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "Using repository secret KEYSTORE_BASE64..."
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$KEYSTORE_FILE"
+            echo "KEYSTORE_FILE_PATH=$KEYSTORE_FILE" >> $GITHUB_ENV
+            echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
+          else
+            echo "Generating self-signed release keystore for community build..."
+            keytool -genkeypair -v -keystore "$KEYSTORE_FILE" \
+              -alias key0 -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "locationspoofer123" -keypass "locationspoofer123" \
+              -dname "CN=LocationSpoofer, OU=Community, O=OpenSource, L=City, S=State, C=CN"
+            echo "KEYSTORE_FILE_PATH=$KEYSTORE_FILE" >> $GITHUB_ENV
+            echo "KEYSTORE_PASSWORD=locationspoofer123" >> $GITHUB_ENV
+            echo "KEY_ALIAS=key0" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=locationspoofer123" >> $GITHUB_ENV
+          fi
+
+      - name: Build Release APKs
+        run: |
+          chmod +x ./gradlew
+          echo "Building Scoped Release APKs..."
+          ./gradlew --no-daemon :app:assembleScopedRelease
+          echo "Building Global Release APKs..."
+          ./gradlew --no-daemon :app:assembleGlobalRelease
+
+      - name: Organize APK Artifacts
+        id: organize_apks
+        run: |
+          DIST_DIR="app/build/outputs/apk/dist"
+          mkdir -p "$DIST_DIR"
+          
+          VERSION=$(grep '^APP_VERSION_NAME=' gradle.properties | head -n 1 | cut -d'=' -f2)
+          [ -z "$VERSION" ] && VERSION="3.0.0"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          for SCHEME in scoped global; do
+            APK_DIR="app/build/outputs/apk/$SCHEME/release"
+            find "$APK_DIR" -name "*.apk" | while read -r file; do
+              BASENAME=$(basename "$file")
+              if [[ "$BASENAME" == *"arm64-v8a"* ]]; then
+                cp "$file" "$DIST_DIR/LocationSpoofer-$SCHEME-arm64-v8a-v$VERSION.apk"
+              elif [[ "$BASENAME" == *"armeabi-v7a"* ]]; then
+                cp "$file" "$DIST_DIR/LocationSpoofer-$SCHEME-armeabi-v7a-v$VERSION.apk"
+              else
+                cp "$file" "$DIST_DIR/LocationSpoofer-$SCHEME-v$VERSION.apk"
+              fi
+            done
+          done
+
+          echo "Collected APKs:"
+          ls -lh "$DIST_DIR"
+          echo "apk_count=$(find "$DIST_DIR" -name "*.apk" | wc -l)" >> $GITHUB_OUTPUT
+
+      - name: Upload APKs Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocationSpoofer-v${{ steps.organize_apks.outputs.version }}-APKs
+          path: app/build/outputs/apk/dist/*.apk
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: github.event.inputs.publish_release != 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.organize_apks.outputs.version }}-opensource-final
+          name: LocationSpoofer v${{ steps.organize_apks.outputs.version }} (Final OpenSource Edition)
+          body: |
+            ## LocationSpoofer 最终开源绝版 (2026-10-09)
+            
+            本版本为上游闭源前最后一次开源提交（Commit `dcbe620`）构建产物：
+            - 机型适配：ColorOS 16 无 TransitionalScanHelper 固件适配 (PLC110)
+            - 修复扫描结果方法中的 List 类型转换兼容性
+            - 包含完整的 Scoped（应用级）与 Global（系统全局）变体
+            
+            ### 安装包说明
+            - `LocationSpoofer-scoped-arm64-v8a-*.apk`: 非全局方案，适合 64 位设备，通过 LSPosed 指定作用域应用
+            - `LocationSpoofer-global-arm64-v8a-*.apk`: 全局方案，适合 64 位设备，Hook 系统服务
+            - `LocationSpoofer-*-armeabi-v7a-*.apk`: 适合 32 位设备
+          files: app/build/outputs/apk/dist/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
